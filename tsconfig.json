@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "paths": {
+      "~*": [
+        "./*"
+      ]
+    },
+    "baseUrl": ".",
+    "target": "ES2020",
+    "lib": [
+      "DOM",
+      "ES2020"
+    ],
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true
+  },
+  "include": [
+    ".plasmo/index.d.ts",
+    "**/*.ts",
+    "**/*.tsx"
+  ],
+  "exclude": ["node_modules", "build", ".plasmo"]
+}
