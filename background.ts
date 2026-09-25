@@ -1,21 +1,32 @@
 export {}
 
-import { EMBEDDED_FORM_PROVIDERS } from "~lib/embedded-forms"
+import { matchFormUrl } from "~lib/embedded-forms"
+import { syncGtmUserScripts } from "~lib/gtm-injector"
+import { parsePixelRequest } from "~lib/pixels"
+import {
+  dataLayerKey,
+  formsKey,
+  MAX_DATALAYER_ENTRIES,
+  MAX_FORM_EVENTS,
+  MAX_NETWORK_HITS,
+  networkKey,
+  snapshotKey,
+  TARGET_TAB_KEY,
+  uid,
+  type ContentMessage,
+  type NetworkHit
+} from "~lib/types"
 
-// No popup.tsx exists anymore, so Chrome doesn't set a default_popup —
-// clicking the toolbar icon fires this instead. We open the dashboard as a
-// real standalone window (type "popup" = no tab strip/address bar, just our
-// UI) sized like an app, not the ~800x600-capped browser action popup Chrome
-// would otherwise force us into.
+// ---------------------------------------------------------------------------
+// Dashboard window
 //
-// Because the dashboard lives in its OWN window, `chrome.tabs.query({
-// currentWindow: true })` from inside it would resolve to the dashboard
-// window itself, not the website the user was looking at. So we capture the
-// tab the icon was actually clicked on (action.onClicked hands it to us
-// directly) and hand that reference to the dashboard via chrome.storage,
-// instead of letting the dashboard guess its own "current" tab.
+// Clicking the toolbar icon opens the dashboard as its own app-style window
+// (type "popup": no tab strip / address bar) instead of the small browser
+// action popup. Because the dashboard lives in its own window, it can't ask
+// for "the current tab" — so we remember the tab the icon was clicked on.
+// ---------------------------------------------------------------------------
+
 const DASHBOARD_PATH = "tabs/dashboard.html"
-const TARGET_TAB_KEY = "trackos:target-tab"
 
 async function rememberTargetTab(tab: chrome.tabs.Tab) {
   if (!tab.id || !tab.url) return
@@ -25,7 +36,7 @@ async function rememberTargetTab(tab: chrome.tabs.Tab) {
   } catch {
     return
   }
-  await chrome.storage.local.set({ [TARGET_TAB_KEY]: { tabId: tab.id, origin, url: tab.url } })
+  await chrome.storage.local.set({ [TARGET_TAB_KEY]: { tabId: tab.id, origin, url: tab.url, title: tab.title } })
 }
 
 async function openOrFocusDashboard(clickedFromTab: chrome.tabs.Tab) {
@@ -75,182 +86,176 @@ chrome.action.onClicked.addListener((tab) => {
 })
 
 // ---------------------------------------------------------------------------
-// Network-request observation for sandboxed/cross-origin contexts.
+// Capture storage
 //
-// A content script can only read the DOM/JS state of frames the Same-Origin
-// Policy allows it into — that's a real, non-negotiable browser boundary,
-// and this extension does not attempt to cross it. But chrome.webRequest
-// operates at the network layer, scoped to the whole TAB, not to a single
-// document — so it can observe requests made by ANY frame in the tab,
-// including a cross-origin or sandboxed iframe (e.g. Shopify's Web Pixels
-// sandbox), without ever touching that frame's DOM. This is the same
-// legitimate mechanism real Shopify pixel-debugging tools use: Shopify's
-// own Web Pixels forward subscribed customer events to its internal
-// "monorail" analytics collector as an ordinary network request — visible
-// at the network layer even though the sandbox's JS state is not.
-//
-// Only requestBody is read here (what the page/frame SENT) — webRequest has
-// never supported reading response bodies, so this can't and doesn't try to
-// see what the server sent back.
+// Per-tab captures go to chrome.storage.session. Writes to the same key are
+// chained so two events arriving together can't overwrite each other.
 // ---------------------------------------------------------------------------
 
-const SHOPIFY_MONORAIL_PATTERN = /monorail-edge\.shopifysvc\.com|monorail\.shopifysvc\.com/i
-const NETWORK_CAPTURE_MAX = 40
+const writeChains = new Map<string, Promise<void>>()
 
-function decodeRequestBody(body: chrome.webRequest.WebRequestBody | undefined): string {
-  if (!body) return ""
+function updateList<T>(key: string, max: number, update: (list: T[]) => T[]) {
+  const previous = writeChains.get(key) ?? Promise.resolve()
+  const next = previous
+    .then(async () => {
+      const res = await chrome.storage.session.get(key)
+      const list = (res[key] as T[] | undefined) ?? []
+      const updated = update(list)
+      await chrome.storage.session.set({ [key]: updated.length > max ? updated.slice(updated.length - max) : updated })
+    })
+    .catch(() => {})
+  writeChains.set(key, next)
+  next.then(() => {
+    if (writeChains.get(key) === next) writeChains.delete(key)
+  })
+  return next
+}
+
+const appendToList = <T>(key: string, max: number, items: T[]) => updateList<T>(key, max, (list) => list.concat(items))
+
+chrome.runtime.onMessage.addListener((message: ContentMessage, sender) => {
+  const tabId = sender.tab?.id
+  if (tabId === undefined || sender.frameId !== 0) return
+  if (message?.type === "trackpro:dl") {
+    appendToList(
+      dataLayerKey(tabId),
+      MAX_DATALAYER_ENTRIES,
+      message.entries.map((e) => ({ ...e, id: uid() }))
+    )
+  } else if (message?.type === "trackpro:snapshot") {
+    chrome.storage.session.set({ [snapshotKey(tabId)]: message.snapshot })
+  } else if (message?.type === "trackpro:form") {
+    appendToList(formsKey(tabId), MAX_FORM_EVENTS, [{ ...message.event, id: uid() }])
+  }
+})
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  chrome.storage.session.remove([dataLayerKey(tabId), networkKey(tabId), snapshotKey(tabId), formsKey(tabId)])
+})
+
+// ---------------------------------------------------------------------------
+// Network observation (read-only)
+//
+// chrome.webRequest sees requests from every frame in a tab — including
+// cross-origin or sandboxed iframes (Shopify Web Pixels, embedded forms) and
+// requests that happen after an ad blocker would hide them from the page.
+// We only read what the page SENT (URL + request body); requests are never
+// blocked or modified, and response bodies are never read.
+// ---------------------------------------------------------------------------
+
+function decodeRequestBody(body: chrome.webRequest.WebRequestBody | null | undefined): {
+  text: string
+  formData?: Record<string, string>
+} {
+  if (!body) return { text: "" }
   try {
-    if (body.raw?.[0]?.bytes) {
-      return new TextDecoder("utf-8").decode(body.raw[0].bytes).slice(0, 1500)
+    if (body.raw?.length) {
+      const decoder = new TextDecoder("utf-8")
+      const text = body.raw.map((part) => (part.bytes ? decoder.decode(part.bytes) : "")).join("")
+      return { text: text.slice(0, 20000) }
     }
     if (body.formData) {
-      return JSON.stringify(body.formData).slice(0, 1500)
+      const formData: Record<string, string> = {}
+      for (const [k, v] of Object.entries(body.formData)) formData[k] = String(v?.[0] ?? "")
+      return { text: "", formData }
     }
   } catch {
-    // ignore decode failures — some bodies are binary/opaque, that's expected
+    // binary / opaque body — expected for some requests
   }
-  return ""
+  return { text: "" }
 }
 
-async function appendCapture(storageKey: string, entry: Record<string, unknown>) {
-  const result = await chrome.storage.local.get(storageKey)
-  const existing = (result[storageKey] as Record<string, unknown>[]) ?? []
-  const updated = [entry, ...existing].slice(0, NETWORK_CAPTURE_MAX)
-  await chrome.storage.local.set({ [storageKey]: updated })
-}
+// Page URL per tab, kept in memory so captures can be stored synchronously
+// (in request order) without an async tab lookup.
+const tabUrls = new Map<number, string>()
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const url = changeInfo.url ?? tab.url
+  if (url) tabUrls.set(tabId, url)
+})
+chrome.tabs.onRemoved.addListener((tabId) => tabUrls.delete(tabId))
 
-async function originForTab(tabId: number): Promise<string | null> {
-  try {
-    const tab = await chrome.tabs.get(tabId)
-    if (!tab.url) return null
-    return new URL(tab.url).origin
-  } catch {
-    return null
-  }
-}
+/** requestId → tab, so the final status can be attached to the stored hits. */
+const pendingRequests = new Map<string, number>()
 
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    if (details.tabId < 0) return // tabId -1 means not associated with a tab (e.g. extension's own requests)
+    if (details.tabId < 0) return // not from a tab (e.g. the extension itself)
 
-    const isShopifyMonorail = SHOPIFY_MONORAIL_PATTERN.test(details.url)
-    const matchedProvider = EMBEDDED_FORM_PROVIDERS.find((p) => p.srcPattern.test(details.url))
+    const body = decodeRequestBody(details.requestBody)
+    const hits = parsePixelRequest(details.url, body.text, body.formData)
+    const formProvider = hits.length ? undefined : matchFormUrl(details.url)
+    if (!hits.length && !formProvider) return
 
-    if (!isShopifyMonorail && !matchedProvider) return
+    const tabId = details.tabId
+    const pageUrl = tabUrls.get(tabId)
+    if (!pageUrl) chrome.tabs.get(tabId).then((t) => t.url && tabUrls.set(tabId, t.url)).catch(() => {})
 
-    const payloadPreview = decodeRequestBody(details.requestBody ?? undefined)
-
-    originForTab(details.tabId).then((origin) => {
-      if (!origin) return
-
-      if (isShopifyMonorail) {
-        appendCapture(`trackos-shopify-network:${origin}`, {
+    if (hits.length) {
+      pendingRequests.set(details.requestId, tabId)
+      const bodyPreview = body.text || (body.formData ? JSON.stringify(body.formData) : "")
+      appendToList<NetworkHit>(
+        networkKey(tabId),
+        MAX_NETWORK_HITS,
+        hits.map((h) => ({
+          ...h,
+          id: uid(),
+          requestId: details.requestId,
+          ts: Date.now(),
           url: details.url,
-          frameId: details.frameId,
-          payloadPreview,
-          timestamp: Date.now()
-        })
-      }
+          method: details.method,
+          body: bodyPreview ? bodyPreview.slice(0, 5000) : undefined,
+          pageUrl
+        }))
+      )
+    }
 
-      if (matchedProvider) {
-        // Merge into the SAME key the postMessage listener writes to, so the
-        // dashboard shows one unified timeline regardless of which legitimate
-        // channel actually surfaced the activity.
-        appendCapture(`trackos-iframe-events:${origin}`, {
-          origin: new URL(details.url).origin,
-          provider: matchedProvider.name,
-          providerId: matchedProvider.id,
-          payloadPreview: payloadPreview || `(request observed, no readable body: ${details.method} ${details.url})`,
-          timestamp: Date.now(),
-          via: "network"
-        })
-      }
-    })
+    // Form/booking providers: only requests that SEND something (a
+    // submission or tracking beacon), not every asset the iframe loads.
+    if (formProvider && details.method !== "GET" && details.type !== "main_frame" && details.type !== "sub_frame") {
+      appendToList(formsKey(tabId), MAX_FORM_EVENTS, [
+        {
+          id: uid(),
+          ts: Date.now(),
+          providerId: formProvider.id,
+          providerName: formProvider.name,
+          via: "network" as const,
+          eventName: `${details.method} ${new URL(details.url).pathname}`,
+          preview: (body.text || JSON.stringify(body.formData ?? {})).slice(0, 1500) || details.url,
+          pageUrl
+        }
+      ])
+    }
   },
   { urls: ["<all_urls>"] },
   ["requestBody"]
 )
 
-// ---------------------------------------------------------------------------
-// Shopify sandbox-frame status: resolves the real top-level tab origin
-// (sender.tab always refers to the top tab regardless of which frame sent
-// the message — the sandbox iframe's own URL is not something a user would
-// recognize, so we key storage by the actual storefront origin instead).
-// ---------------------------------------------------------------------------
+function recordOutcome(requestId: string, outcome: { status?: number; error?: string }) {
+  const tabId = pendingRequests.get(requestId)
+  if (tabId === undefined) return
+  pendingRequests.delete(requestId)
+  updateList<NetworkHit>(networkKey(tabId), MAX_NETWORK_HITS, (list) =>
+    list.map((h) => (h.requestId === requestId ? { ...h, ...outcome } : h))
+  )
+}
 
-chrome.runtime.onMessage.addListener((message, sender) => {
-  if (message?.type !== "trackos:shopify-sandbox-report") return
-  if (!sender.tab?.url) return
-  let origin: string
-  try {
-    origin = new URL(sender.tab.url).origin
-  } catch {
-    return
-  }
-  chrome.storage.local.set({ [`trackos-shopify-sandbox:${origin}`]: { ...message.payload, updatedAt: Date.now() } })
+chrome.webRequest.onCompleted.addListener((d) => recordOutcome(d.requestId, { status: d.statusCode }), {
+  urls: ["<all_urls>"]
+})
+chrome.webRequest.onErrorOccurred.addListener((d) => recordOutcome(d.requestId, { error: d.error }), {
+  urls: ["<all_urls>"]
 })
 
 // ---------------------------------------------------------------------------
-// GTM Injector — persistent, origin-scoped auto-reinjection.
-//
-// A one-time chrome.scripting.executeScript() only lives in the single page
-// load it ran on. Any real navigation — the user reloading, clicking a
-// link, or critically, Google's own GTM Preview/Tag Assistant "Connect"
-// flow performing its own navigation to establish its debug handshake —
-// throws that injection away, because the browser loaded a genuinely fresh,
-// un-injected page. That's why Tag Assistant reported the container "not
-// found" even right after a successful injection: it had connected to a
-// fresh load of the page in a different navigation than the one that was
-// injected.
-//
-// The fix: keep a persistent origin -> GTM ID map in storage, and
-// re-inject automatically on every single main-frame navigation to a
-// matching origin, in any tab, until the user explicitly disconnects.
-// This is what makes it behave like a real installation for as long as the
-// session is active, rather than a single one-off injection.
+// GTM Injector — runs the user's own GTM snippet via chrome.userScripts.
+// See lib/gtm-injector.ts for why (Chrome Web Store remote-code policy).
+// Registered user scripts persist on their own; this re-syncs them with
+// storage after a browser restart or extension update.
 // ---------------------------------------------------------------------------
 
-const GTM_SESSIONS_KEY = "trackos-gtm-injection-sessions"
-
-function injectGtmSnippetIntoPage(gtmId: string) {
-  const w = window as any
-  if (w.google_tag_manager && w.google_tag_manager[gtmId]) return
-  ;(function (w2: any, d: Document, s: string, l: string, i: string) {
-    w2[l] = w2[l] || []
-    w2[l].push({ "gtm.start": new Date().getTime(), event: "gtm.js" })
-    const f = d.getElementsByTagName(s)[0]
-    const j = d.createElement(s) as HTMLScriptElement
-    const dl = l !== "dataLayer" ? "&l=" + l : ""
-    j.async = true
-    j.src = "https://www.googletagmanager.com/gtm.js?id=" + i + dl
-    f.parentNode?.insertBefore(j, f)
-  })(w, document, "script", "dataLayer", gtmId)
-}
-
-if (chrome.webNavigation) {
-  chrome.webNavigation.onCommitted.addListener((details) => {
-    if (details.frameId !== 0) return // main frame only — no reason to inject into every iframe
-    let origin: string
-    try {
-      origin = new URL(details.url).origin
-    } catch {
-      return
-    }
-    chrome.storage.local.get(GTM_SESSIONS_KEY, (res) => {
-      const sessions: Record<string, string> = res[GTM_SESSIONS_KEY] ?? {}
-      const gtmId = sessions[origin]
-      if (!gtmId) return
-      chrome.scripting
-        .executeScript({
-          target: { tabId: details.tabId },
-          world: "MAIN",
-          func: injectGtmSnippetIntoPage,
-          args: [gtmId]
-        })
-        .catch(() => {
-          // Tab may have closed or navigated again before this ran — fine,
-          // the next onCommitted for that origin will just try again.
-        })
-    })
-  })
-}
+chrome.runtime.onStartup.addListener(() => {
+  syncGtmUserScripts().catch(() => {})
+})
+chrome.runtime.onInstalled.addListener(() => {
+  syncGtmUserScripts().catch(() => {})
+})

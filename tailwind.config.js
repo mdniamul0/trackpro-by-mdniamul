@@ -1,5 +1,5 @@
 module.exports = {
-  content: ["./tabs/**/*.tsx", "./lib/**/*.tsx"],
+  content: ["./tabs/**/*.tsx", "./lib/**/*.{ts,tsx}", "./components/**/*.tsx"],
   theme: {
     extend: {
       colors: {

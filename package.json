@@ -1,13 +1,14 @@
 {
   "name": "trackpro",
   "displayName": "TrackPro by MD Niamul – Data Layer Checker, GTM Injector, Variable Builder",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "See your real Data Layer, inject & test GTM, and catch every ad pixel event firing — one tracking workbench by MD Niamul.",
   "author": "MD Niamul",
   "scripts": {
     "dev": "plasmo dev",
-    "build": "plasmo build",
-    "package": "plasmo package"
+    "build": "plasmo build && node scripts/finalize-build.mjs",
+    "verify:store": "node scripts/verify-store-build.mjs",
+    "package": "npm run build && node scripts/verify-store-build.mjs && plasmo package && node scripts/release.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.33.0",
@@ -30,14 +31,15 @@
       "http://*/*"
     ],
     "permissions": [
-      "cookies",
       "storage",
-      "activeTab",
       "scripting",
+      "userScripts",
       "system.display",
       "webRequest",
-      "webNavigation",
       "tabs"
-    ]
-  }
+    ],
+    "minimum_chrome_version": "120",
+    "homepage_url": "https://mdniamul.com"
+  },
+  "homepage": "https://mdniamul.com"
 }
